@@ -15,15 +15,16 @@ const LOG = '[RU-Fixer]';
 const SYSTEM_PROMPT = 'Ты — точный редактор-переводчик. Ты не участвуешь в ролевой игре, не отыгрываешь персонажей и ничего не сочиняешь. Ты возвращаешь только обработанный текст, без комментариев, без рассуждений и без пояснений.';
 
 const DEFAULT_PROMPT = `[Служебная задача. Это не ролевая игра.
-Ниже дан фрагмент текста. Основной язык текста — русский, но в нём случайно встречаются английские слова и фразы.
-Задача: перевести ТОЛЬКО английские слова и фразы на русский так, чтобы они естественно вписались в смысл, падеж, число, род и стиль предложения.
+Ниже дан фрагмент текста. Основной язык текста — русский, но в нём случайно встречаются вставки на других языках ({{langs}}).
+Задача: перевести на русский ТОЛЬКО нерусские слова и фразы так, чтобы они естественно вписались в смысл, падеж, число, род и стиль предложения.
 Правила:
 1. Русские части текста не изменяй ни на букву.
 2. Полностью сохрани структуру, абзацы, пунктуацию и форматирование (*курсив*, **жирный**, "кавычки", разметку).
 3. Ничего не добавляй, не сокращай, не продолжай текст, не комментируй.
 4. Не трогай имена собственные и ники, содержимое блоков кода и макросы в двойных фигурных скобках.
-5. Если английских слов нет — верни текст без изменений.
-6. Не рассуждай. Сразу выдай готовый результат.
+5. Иероглифы, кану, хангыль и прочие нерусские символы переводи по смыслу, а не транслитерируй.
+6. Если переводить нечего — верни текст без изменений.
+7. Не рассуждай. Сразу выдай готовый результат.
 Ответь ТОЛЬКО итоговым текстом, без пояснений и без кавычек вокруг него.]
 
 ТЕКСТ:
@@ -45,6 +46,7 @@ const DEFAULT_FULL_PROMPT = `[Служебная задача. Это не ро�
 const defaultSettings = {
     enabled: true,
     auto: false,
+    detectMode: 'any',      // 'any' — любой нерусский текст, 'latin' — только латиница
     minLen: 2,
     skipCode: true,
     whitelist: '',
@@ -88,32 +90,78 @@ function settings() {
     return extension_settings[MODULE_NAME];
 }
 
-/* ---------------- детект английских слов ---------------- */
+/* ---------------- определение письменностей ---------------- */
+
+const SCRIPTS = [
+    { key: 'latin',    label: 'латиница',            re: /\p{Script=Latin}/u },
+    { key: 'han',      label: 'китайские иероглифы', re: /\p{Script=Han}/u },
+    { key: 'kana',     label: 'японская кана',       re: /\p{Script=Hiragana}|\p{Script=Katakana}/u },
+    { key: 'hangul',   label: 'корейский хангыль',   re: /\p{Script=Hangul}/u },
+    { key: 'arabic',   label: 'арабский',            re: /\p{Script=Arabic}/u },
+    { key: 'hebrew',   label: 'иврит',               re: /\p{Script=Hebrew}/u },
+    { key: 'greek',    label: 'греческий',           re: /\p{Script=Greek}/u },
+    { key: 'deva',     label: 'деванагари',          re: /\p{Script=Devanagari}/u },
+    { key: 'thai',     label: 'тайский',             re: /\p{Script=Thai}/u },
+    { key: 'armenian', label: 'армянский',           re: /\p{Script=Armenian}/u },
+    { key: 'georgian', label: 'грузинский',          re: /\p{Script=Georgian}/u },
+];
+
+const RE_CYRILLIC = /\p{Script=Cyrillic}/u;
+const RE_LATIN = /\p{Script=Latin}/u;
+// письменности без пробелов — к ним минимальная длина не применяется
+const RE_NO_MINLEN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}]/u;
+// любая буква, включая диакритику
+const RE_TOKEN = /[\p{L}\p{M}][\p{L}\p{M}'’\-]*/gu;
 
 function stripProtected(text) {
     return String(text)
-        .replace(/```[\s\S]*?```/g, ' ')
-        .replace(/`[^`\n]*`/g, ' ')
-        .replace(/https?:\/\/\S+/gi, ' ')
-        .replace(/\{\{[^}]*\}\}/g, ' ')
-        .replace(/<[^>]+>/g, ' ');
+        .replace(/```[\s\S]*?```/g, ' ')      // блоки кода
+        .replace(/`[^`\n]*`/g, ' ')           // инлайн-код
+        .replace(/https?:\/\/\S+/gi, ' ')     // ссылки
+        .replace(/\{\{[^}]*\}\}/g, ' ')       // макросы {{user}} и т.п.
+        .replace(/<[^>]+>/g, ' ');            // html-теги
 }
 
-function findEnglishWords(text) {
-    const s = settings().skipCode ? stripProtected(text) : String(text);
+/**
+ * Ищет фрагменты не на русском.
+ * @returns {{words: string[], scripts: string[]}}
+ */
+function findForeign(text) {
+    const s = settings();
+    const src = s.skipCode ? stripProtected(text) : String(text);
+
     const white = new Set(
-        String(settings().whitelist).toLowerCase().split(/[\s,;]+/).filter(Boolean),
+        String(s.whitelist).toLowerCase().split(/[\s,;]+/).filter(Boolean),
     );
-    const found = new Set();
-    const re = /[A-Za-z][A-Za-z'’\-]*/g;
+
+    const words = new Set();
+    const scriptKeys = new Set();
+
     let m;
-    while ((m = re.exec(s)) !== null) {
-        const w = m[0];
-        if (w.length < settings().minLen) continue;
-        if (white.has(w.toLowerCase())) continue;
-        found.add(w);
+    RE_TOKEN.lastIndex = 0;
+    while ((m = RE_TOKEN.exec(src)) !== null) {
+        const token = m[0];
+
+        // токен интересен, если в нём есть нужные "чужие" буквы
+        const isForeign = s.detectMode === 'latin'
+            ? RE_LATIN.test(token)
+            : !RE_CYRILLIC.test(token);
+
+        if (!isForeign) continue;
+
+        // отдельные латинские буквы в русских словах (типа "V-образный") тоже сюда попадут — их фильтрует minLen
+        if (!RE_NO_MINLEN.test(token) && token.length < s.minLen) continue;
+        if (white.has(token.toLowerCase())) continue;
+
+        words.add(token);
+
+        for (const sc of SCRIPTS) {
+            if (sc.re.test(token)) scriptKeys.add(sc.key);
+        }
     }
-    return [...found];
+
+    const scripts = SCRIPTS.filter(sc => scriptKeys.has(sc.key)).map(sc => sc.label);
+    return { words: [...words], scripts };
 }
 
 /* ---------------- собственный API ---------------- */
@@ -231,10 +279,10 @@ async function callCustomAPI(prompt, maxTokens) {
         } catch { /* ignore */ }
 
         if (/reasoning|thinking|token limit was exhausted/i.test(msg)) {
-            msg += ' → Совет: в настройках RU Fixer выбери «Reasoning: отключить» и/или подними «Запас токенов на reasoning» до 2000–4000.';
+            msg += ' → Совет: выбери «Reasoning: отключить» и/или подними «Запас токенов на reasoning» до 2000–4000.';
         }
         if (/max_tokens|max_completion_tokens/i.test(msg)) {
-            msg += ' → Совет: включи галку «max_completion_tokens вместо max_tokens».';
+            msg += ' → Совет: включи «max_completion_tokens вместо max_tokens».';
         }
         if (/temperature/i.test(msg)) {
             msg += ' → Совет: поставь температуру 1.';
@@ -277,7 +325,9 @@ async function fetchModelList() {
 /* ---------------- вызов модели ---------------- */
 
 function estimateTokens(text) {
-    const auto = Math.ceil(text.length / 1.6) + 96;
+    // иероглифы «весят» больше, поэтому запас щедрый
+    const cjk = (text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu) || []).length;
+    const auto = Math.ceil(text.length / 1.6) + cjk * 2 + 96;
     return Math.min(Math.max(auto, 256), 6000);
 }
 
@@ -316,7 +366,7 @@ async function callLLM(prompt, responseLength) {
     return await fn(prompt, '', false, false, SYSTEM_PROMPT, responseLength);
 }
 
-function buildPrompt(text, messageId, full) {
+function buildPrompt(text, messageId, full, scripts) {
     const s = settings();
     let contextBlock = '';
 
@@ -332,7 +382,10 @@ function buildPrompt(text, messageId, full) {
     }
 
     const tpl = full ? s.fullPrompt : s.prompt;
-    const body = tpl.includes('{{text}}') ? tpl.replace('{{text}}', text) : `${tpl}\n\n${text}`;
+    const langs = (scripts && scripts.length) ? scripts.join(', ') : 'латиница';
+
+    let body = tpl.replace(/\{\{langs\}\}/g, langs);
+    body = body.includes('{{text}}') ? body.replace('{{text}}', text) : `${body}\n\n${text}`;
 
     return contextBlock + body;
 }
@@ -380,7 +433,7 @@ async function processMessage(messageId, { silent = false, full = false } = {}) 
         return false;
     }
     if (message.is_user && !full) {
-        if (!silent) toastr.info('Сообщения пользователя проверяются только в режиме полного перевода.');
+        if (!silent) toastr.info('Сообщения пользователя обрабатываются только в режиме полного перевода (Ctrl+клик).');
         return false;
     }
 
@@ -393,10 +446,13 @@ async function processMessage(messageId, { silent = false, full = false } = {}) 
     }
 
     let words = [];
+    let scripts = [];
     if (!full) {
-        words = findEnglishWords(original);
+        const res = findForeign(original);
+        words = res.words;
+        scripts = res.scripts;
         if (words.length === 0) {
-            if (!silent && s.notify) toastr.info('Английских слов не найдено.');
+            if (!silent && s.notify) toastr.info('Иноязычных вставок не найдено.');
             return false;
         }
     }
@@ -406,9 +462,9 @@ async function processMessage(messageId, { silent = false, full = false } = {}) 
     $btn.addClass('ru_fixer_spin');
 
     try {
-        if (!full) console.log(`${LOG} найдено:`, words);
+        if (!full) console.log(`${LOG} найдено (${scripts.join(', ')}):`, words);
 
-        const prompt = buildPrompt(original, messageId, full);
+        const prompt = buildPrompt(original, messageId, full, scripts);
         const len = s.responseLength > 0 ? s.responseLength : estimateTokens(original);
         const raw = await callLLM(prompt, len);
         const fixed = cleanResult(raw, original, { checkSanity: !full });
@@ -434,7 +490,10 @@ async function processMessage(messageId, { silent = false, full = false } = {}) 
         await saveChatConditional();
 
         if (s.notify) {
-            toastr.success(full ? 'Сообщение переведено целиком.' : `Исправлено слов/фраз: ${words.length}`, 'RU Fixer');
+            toastr.success(
+                full ? 'Сообщение переведено целиком.' : `Исправлено фрагментов: ${words.length} (${scripts.join(', ')})`,
+                'RU Fixer',
+            );
         }
         return true;
     } catch (err) {
@@ -486,7 +545,7 @@ async function fixLastMessage(full = false) {
 /* ---------------- кнопки в сообщениях ---------------- */
 
 const BUTTON_HTML = `<div class="mes_button mes_ru_fix fa-solid fa-language interactable" tabindex="0"
-    title="RU Fixer&#10;Клик — перевести английские слова&#10;Ctrl+клик — перевести сообщение целиком&#10;Shift+клик — вернуть оригинал"></div>`;
+    title="RU Fixer&#10;Клик — перевести иноязычные вставки&#10;Ctrl+клик — перевести сообщение целиком&#10;Shift+клик — вернуть оригинал"></div>`;
 
 function injectButtons() {
     const $tpl = $('#message_template .mes_buttons .extraMesButtons');
@@ -503,7 +562,7 @@ const SETTINGS_HTML = `
 <div class="ru_fixer_settings">
   <div class="inline-drawer">
     <div class="inline-drawer-toggle inline-drawer-header">
-      <b>RU Fixer — доперевод английских слов</b>
+      <b>RU Fixer — доперевод иноязычных вставок</b>
       <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
     </div>
     <div class="inline-drawer-content">
@@ -513,6 +572,12 @@ const SETTINGS_HTML = `
       <label class="checkbox_label"><input id="ruf_skipcode" type="checkbox"> Игнорировать код, ссылки, макросы и HTML</label>
       <label class="checkbox_label"><input id="ruf_sanity" type="checkbox"> Защита от «фантазий» модели (для полного перевода не применяется)</label>
       <label class="checkbox_label"><input id="ruf_notify" type="checkbox"> Показывать уведомления</label>
+
+      <label for="ruf_detect">Что считать «чужим» текстом</label>
+      <select id="ruf_detect" class="text_pole">
+        <option value="any">Всё, кроме кириллицы (латиница, иероглифы, кана, хангыль, арабский и т.д.)</option>
+        <option value="latin">Только латиница</option>
+      </select>
 
       <hr class="sysHR">
       <label class="checkbox_label"><input id="ruf_usecustom" type="checkbox">
@@ -548,7 +613,7 @@ const SETTINGS_HTML = `
         <input id="ruf_rbudget" class="text_pole" type="number" min="0" max="32000" step="500">
 
         <label class="checkbox_label"><input id="ruf_nomax" type="checkbox">
-          Вообще не слать лимит токенов (если провайдер ругается)</label>
+          Вообще не слать лимит токенов</label>
 
         <label for="ruf_temp">Температура</label>
         <input id="ruf_temp" class="text_pole" type="number" step="0.05" min="0" max="2">
@@ -579,7 +644,7 @@ const SETTINGS_HTML = `
       <label class="checkbox_label"><input id="ruf_usechat" type="checkbox">
         Если свой API выключен: слать проверку вместе с историей чата</label>
 
-      <label for="ruf_minlen">Минимальная длина английского слова для реакции</label>
+      <label for="ruf_minlen">Минимальная длина слова для реакции (к иероглифам и кане не применяется)</label>
       <input id="ruf_minlen" class="text_pole" type="number" min="1" max="10">
 
       <label for="ruf_ctx">Сколько предыдущих сообщений подклеить как контекст (0 — не подклеивать)</label>
@@ -592,10 +657,10 @@ const SETTINGS_HTML = `
       <textarea id="ruf_white" class="text_pole textarea_compact" rows="2"
         placeholder="Alex, Kaine, OK, HP, USB"></textarea>
 
-      <label for="ruf_prompt">Промпт для доперевода отдельных слов (нужен <code>{{text}}</code>)</label>
+      <label for="ruf_prompt">Промпт для доперевода (макросы <code>{{text}}</code>, <code>{{langs}}</code>)</label>
       <textarea id="ruf_prompt" class="text_pole textarea_compact" rows="9"></textarea>
 
-      <label for="ruf_fullprompt">Промпт для полного перевода сообщения (нужен <code>{{text}}</code>)</label>
+      <label for="ruf_fullprompt">Промпт для полного перевода (нужен <code>{{text}}</code>)</label>
       <textarea id="ruf_fullprompt" class="text_pole textarea_compact" rows="8"></textarea>
 
       <div class="flex-container">
@@ -605,9 +670,9 @@ const SETTINGS_HTML = `
       </div>
 
       <small class="opacity50p">
-        Кнопка в сообщении: клик — доперевод, Ctrl+клик — полный перевод, Shift+клик — откат к оригиналу.<br>
-        Исправленный текст заменяет оригинал, поэтому в контекст следующей генерации уходит уже русская версия.<br>
-        Ключ хранится в настройках ST в открытом виде.
+        Кнопка в сообщении: клик — доперевод, Ctrl+клик — полный перевод, Shift+клик — откат.<br>
+        Команды: <code>/fixru</code>, <code>/trru 0</code> (перевести приветствие карточки).<br>
+        Исправленный текст заменяет оригинал, поэтому в контекст следующей генерации уходит русская версия.
       </small>
 
     </div>
@@ -625,6 +690,7 @@ function loadSettingsUI() {
     $('#ruf_skipcode').prop('checked', s.skipCode);
     $('#ruf_sanity').prop('checked', s.sanity);
     $('#ruf_notify').prop('checked', s.notify);
+    $('#ruf_detect').val(s.detectMode);
     $('#ruf_usechat').prop('checked', s.useChatContext);
 
     $('#ruf_usecustom').prop('checked', s.useCustomApi);
@@ -660,6 +726,7 @@ function bindSettingsUI() {
     $('#ruf_skipcode').on('change', function () { s.skipCode = !!$(this).prop('checked'); save(); });
     $('#ruf_sanity').on('change', function () { s.sanity = !!$(this).prop('checked'); save(); });
     $('#ruf_notify').on('change', function () { s.notify = !!$(this).prop('checked'); save(); });
+    $('#ruf_detect').on('change', function () { s.detectMode = String($(this).val()); save(); });
     $('#ruf_usechat').on('change', function () { s.useChatContext = !!$(this).prop('checked'); save(); });
 
     $('#ruf_usecustom').on('change', function () {
@@ -779,22 +846,21 @@ jQuery(async () => {
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'fixru',
             callback: async (_args, value) => {
-                const chat = getContext().chat;
-                const id = value !== '' && value !== undefined ? Number(value) : lastCharMessageId();
+                const id = (value !== '' && value !== undefined) ? Number(value) : lastCharMessageId();
                 await processMessage(id, { full: false });
                 return '';
             },
-            helpString: 'Перевести английские слова в сообщении (по умолчанию — в последнем).',
+            helpString: 'Перевести иноязычные вставки в сообщении (по умолчанию — в последнем).',
         }));
 
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'trru',
             callback: async (_args, value) => {
-                const id = value !== '' && value !== undefined ? Number(value) : lastCharMessageId();
+                const id = (value !== '' && value !== undefined) ? Number(value) : lastCharMessageId();
                 await processMessage(id, { full: true });
                 return '';
             },
-            helpString: 'Перевести сообщение целиком на русский (по умолчанию — последнее). Пример: /trru 0 — приветствие.',
+            helpString: 'Перевести сообщение целиком на русский. Пример: /trru 0 — приветствие карточки.',
         }));
     } catch (err) {
         console.warn(`${LOG} слэш-команды не зарегистрированы:`, err);
