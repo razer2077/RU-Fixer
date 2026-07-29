@@ -1,0 +1,14 @@
+.ru_fixer_settings .text_pole { width: 100%; }
+.ru_fixer_settings label { display: block; margin-top: 6px; }
+.ru_fixer_settings #ruf_status { margin-top: 6px; font-size: 0.9em; word-break: break-word; }
+.ru_fixer_settings .flex1 { flex: 1; }
+
+.mes_ru_fix { cursor: pointer; }
+.mes_ru_fix.ru_fixer_spin {
+    animation: ruf-spin 1s linear infinite;
+    opacity: 0.8;
+}
+@keyframes ruf-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+}
